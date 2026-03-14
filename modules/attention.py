@@ -2,6 +2,7 @@ import torch
 
 from einops import rearrange
 from torch import nn
+import math
 
 
 class CausalSelfAttention(nn.Module):
@@ -34,8 +35,29 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
 
     ### YOUR CODE HERE
-    raise NotImplementedError
+    # Calculate the attention scores by matrix multiplication of query and key. Then, apply the attention mask to the scores.
+    # Next, apply softmax to get the attention probabilities. Then, apply dropout to the attention probabilities. Finally, calculate the attention value by matrix multiplication of attention probabilities and value. 
 
+    # transpose key to [bs, num_attention_heads, attention_head_size, seq_len] for matrix multiplication.
+    key_transpose = rearrange(key, 'b h t d -> b h d t')
+
+    # matrix multiplication
+    attn_scores = torch.matmul(query, key_transpose) / math.sqrt(self.attention_head_size)
+
+    # apply causal mask
+    causal_mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)), diagonal=1).to(attn_scores.device)
+    attn_scores = attn_scores.masked_fill(causal_mask == 1, float('-inf'))
+
+    # apply attention mask
+    attn_scores = attn_scores + attention_mask
+    attn_probs = nn.functional.softmax(attn_scores, dim=-1)
+    attn_probs = self.dropout(attn_probs)
+    attn_value = torch.matmul(attn_probs, value)
+
+    # shape of attn_value is [bs, num_attention_heads, seq_len, attention_head_size]. We need to reshape it back to [bs, seq_len, hidden_state] by proper transpose and reshape.
+    attn_value = rearrange(attn_value, 'b h t d -> b t (h d)')
+
+    return attn_value
 
   def forward(self, hidden_states, attention_mask):
     """

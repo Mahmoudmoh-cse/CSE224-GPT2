@@ -55,7 +55,9 @@ class GPT2SentimentClassifier(torch.nn.Module):
 
     ### TODO: Create any instance variables you need to classify the sentiment of BERT embeddings.
     ### YOUR CODE HERE
-    raise NotImplementedError
+    self.classifier = torch.nn.Linear(self.gpt.config.hidden_size, self.num_labels)
+    self.dropout = torch.nn.Dropout(config.hidden_dropout_prob)
+
 
 
   def forward(self, input_ids, attention_mask):
@@ -65,7 +67,23 @@ class GPT2SentimentClassifier(torch.nn.Module):
     ###       HINT: You should consider what is an appropriate return value given that
     ###       the training loop currently uses F.cross_entropy as the loss function.
     ### YOUR CODE HERE
-    raise NotImplementedError
+
+    # run gpt2 on the input sentences to get the contextualized embeddings
+    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+
+    # get the hidden state of the last token for each sentence in the batch
+    last_token_hidden_state = outputs["last_token"]
+
+    # apply dropout 
+    last_token_hidden_state = self.dropout(last_token_hidden_state)
+
+    # apply a linear layer to get the logits for each sentiment class
+    logits = self.classifier(last_token_hidden_state)
+
+    # verify that the output shape is correct (batch_size, num_labels)
+    assert logits.shape == (input_ids.shape[0], self.num_labels)
+    return logits
+  
 
 
 
