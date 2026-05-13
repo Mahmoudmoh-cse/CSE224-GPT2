@@ -1,0 +1,13 @@
+{
+  "id": "mahmoudmohamed231846/cs224n-gpt2-sst-new-code",
+  "title": "CS224N GPT2 SST New Code",
+  "code_file": "cs224n_gpt2_sst_new_code.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}
