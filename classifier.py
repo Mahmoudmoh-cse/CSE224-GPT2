@@ -308,7 +308,7 @@ def train(args):
 
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
-      loss = F.cross_entropy(logits, b_labels.view(-1), reduction='sum') / args.batch_size
+      loss = F.cross_entropy(logits, b_labels.view(-1), reduction='mean')
 
       loss.backward()
       optimizer.step()
@@ -334,7 +334,7 @@ def train(args):
 def test(args):
   with torch.no_grad():
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-    saved = torch.load(args.filepath)
+    saved = torch.load(args.filepath, weights_only=False)
     config = saved['model_config']
     model = GPT2SentimentClassifier(config)
     model.load_state_dict(saved['model'])
@@ -372,16 +372,16 @@ def test(args):
 def get_args():
   parser = argparse.ArgumentParser()
   parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, default=10)
+  parser.add_argument("--epochs", type=int, default=5)
   parser.add_argument("--fine-tune-mode", type=str,
                       help='last-linear-layer: the GPT parameters are frozen and the task specific head parameters are updated; full-model: GPT parameters are updated as well',
-                      choices=('last-linear-layer', 'full-model'), default="last-linear-layer")
+                      choices=('last-linear-layer', 'full-model'), default="full-model")
   parser.add_argument("--use_gpu", action='store_true')
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
-  parser.add_argument("--lr", type=float, help="learning rate, default lr for 'pretrain': 1e-3, 'finetune': 1e-5",
-                      default=1e-3)
+  parser.add_argument("--lr", type=float, help="learning rate, default lr for full-model fine-tuning: 1e-5",
+                      default=1e-5)
 
   args = parser.parse_args()
   return args
