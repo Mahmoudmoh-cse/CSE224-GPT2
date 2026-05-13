@@ -12,6 +12,7 @@ trains and evaluates your ParaphraseGPT model and writes the required submission
 '''
 
 import argparse
+import os
 import random
 import torch
 
@@ -33,6 +34,9 @@ from models.gpt2 import GPT2Model
 from optimizer import AdamW
 
 TQDM_DISABLE = False
+OUTPUT_DIR = "/kaggle/working" if os.path.isdir("/kaggle/working") else "."
+CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+PREDICTION_DIR = os.path.join(OUTPUT_DIR, "predictions")
 
 # Fix the random seed.
 def seed_everything(seed=11711):
@@ -70,13 +74,13 @@ class ParaphraseGPT(nn.Module):
      of 3919) for examples that are not paraphrases.
     """
 
-    'Takes a batch of sentences and produces embeddings for them.'
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    return self.paraphrase_detection_head(outputs['last_token'])
 
 
 
 def save_model(model, optimizer, args, filepath):
+  os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
   save_info = {
     'model': model.state_dict(),
     'optim': optimizer.state_dict(),
@@ -144,7 +148,7 @@ def train(args):
       best_dev_acc = dev_acc
       save_model(model, optimizer, args, args.filepath)
 
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
+    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}, dev f1 :: {dev_f1 :.3f}")
 
 
 @torch.no_grad()
@@ -167,7 +171,7 @@ def test(args):
 
   para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
                                    collate_fn=para_dev_data.collate_fn)
-  para_test_dataloader = DataLoader(para_test_data, shuffle=True, batch_size=args.batch_size,
+  para_test_dataloader = DataLoader(para_test_data, shuffle=False, batch_size=args.batch_size,
                                     collate_fn=para_test_data.collate_fn)
 
   dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase(para_dev_dataloader, model, device)
@@ -228,8 +232,13 @@ def add_arguments(args):
 
 
 if __name__ == "__main__":
+  os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+  os.makedirs(PREDICTION_DIR, exist_ok=True)
   args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # Save path.
+  run_name = f'paraphrase-{args.model_size}-e{args.epochs}-lr{args.lr}-bs{args.batch_size}-seed{args.seed}'
+  args.filepath = os.path.join(CHECKPOINT_DIR, f'{run_name}.pt')  # Save path.
+  args.para_dev_out = os.path.join(PREDICTION_DIR, f'{run_name}-dev-out.csv')
+  args.para_test_out = os.path.join(PREDICTION_DIR, f'{run_name}-test-out.csv')
   seed_everything(args.seed)  # Fix the seed for reproducibility.
   train(args)
   test(args)

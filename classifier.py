@@ -4,6 +4,7 @@
 Trains and evaluates GPT2SentimentClassifier on SST and CFIMDB
 '''
 
+import os
 import random, numpy as np, argparse
 from types import SimpleNamespace
 import csv
@@ -19,6 +20,9 @@ from optimizer import AdamW
 from tqdm import tqdm
 
 TQDM_DISABLE = False
+OUTPUT_DIR = "/kaggle/working" if os.path.isdir("/kaggle/working") else "."
+CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+PREDICTION_DIR = os.path.join(OUTPUT_DIR, "predictions")
 
 
 # Fix the random seed.
@@ -244,6 +248,7 @@ def model_test_eval(dataloader, model, device):
 
 
 def save_model(model, optimizer, args, config, filepath):
+  os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
   save_info = {
     'model': model.state_dict(),
     'optim': optimizer.state_dict(),
@@ -320,7 +325,10 @@ def train(args):
       best_dev_acc = dev_acc
       save_model(model, optimizer, args, config, args.filepath)
 
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
+    print(
+      f"Epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, "
+      f"train f1 :: {train_f1 :.3f}, dev acc :: {dev_acc :.3f}, dev f1 :: {dev_f1 :.3f}"
+    )
 
 
 def test(args):
@@ -380,12 +388,17 @@ def get_args():
 
 
 if __name__ == "__main__":
+  os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+  os.makedirs(PREDICTION_DIR, exist_ok=True)
   args = get_args()
   seed_everything(args.seed)
 
   print('Training Sentiment Classifier on SST...')
   config = SimpleNamespace(
-    filepath='sst-classifier.pt',
+    filepath=os.path.join(
+      CHECKPOINT_DIR,
+      f'sst-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs{args.batch_size}-seed{args.seed}.pt'
+    ),
     lr=args.lr,
     use_gpu=args.use_gpu,
     epochs=args.epochs,
@@ -395,8 +408,14 @@ if __name__ == "__main__":
     dev='data/ids-sst-dev.csv',
     test='data/ids-sst-test-student.csv',
     fine_tune_mode=args.fine_tune_mode,
-    dev_out='predictions/' + args.fine_tune_mode + '-sst-dev-out.csv',
-    test_out='predictions/' + args.fine_tune_mode + '-sst-test-out.csv'
+    dev_out=os.path.join(
+      PREDICTION_DIR,
+      f'sst-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs{args.batch_size}-seed{args.seed}-dev-out.csv'
+    ),
+    test_out=os.path.join(
+      PREDICTION_DIR,
+      f'sst-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs{args.batch_size}-seed{args.seed}-test-out.csv'
+    )
   )
 
   train(config)
@@ -406,7 +425,10 @@ if __name__ == "__main__":
 
   print('Training Sentiment Classifier on cfimdb...')
   config = SimpleNamespace(
-    filepath='cfimdb-classifier.pt',
+    filepath=os.path.join(
+      CHECKPOINT_DIR,
+      f'cfimdb-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs8-seed{args.seed}.pt'
+    ),
     lr=args.lr,
     use_gpu=args.use_gpu,
     epochs=args.epochs,
@@ -416,8 +438,14 @@ if __name__ == "__main__":
     dev='data/ids-cfimdb-dev.csv',
     test='data/ids-cfimdb-test-student.csv',
     fine_tune_mode=args.fine_tune_mode,
-    dev_out='predictions/' + args.fine_tune_mode + '-cfimdb-dev-out.csv',
-    test_out='predictions/' + args.fine_tune_mode + '-cfimdb-test-out.csv'
+    dev_out=os.path.join(
+      PREDICTION_DIR,
+      f'cfimdb-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs8-seed{args.seed}-dev-out.csv'
+    ),
+    test_out=os.path.join(
+      PREDICTION_DIR,
+      f'cfimdb-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs8-seed{args.seed}-test-out.csv'
+    )
   )
 
   train(config)

@@ -54,9 +54,6 @@ class GPT2Model(GPTPreTrainedModel):
     # Then, use self.position_ids to get position embedding from self.pos_embedding into pos_emb
     inputs_embeds = self.word_embedding(input_ids)
 
-    ### TODO: Use pos_ids to get position embedding from self.pos_embedding into pos_embeds.
-    ###       Then, add two embeddings together; then apply dropout and return.
-    ### YOUR CODE HERE
     pos_ids = self.position_ids[:, :seq_length]
     pos_embeds = self.pos_embedding(pos_ids)
 
@@ -108,13 +105,12 @@ class GPT2Model(GPTPreTrainedModel):
 
       return hidden_state(s) * E^T
     """
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    return torch.matmul(hidden_state, self.word_embedding.weight.T)
 
 
   @classmethod
   def from_pretrained(cls, model='gpt2', d=768, l=12, num_heads=12):
-    gpt_model = OpenAIGPT2Model.from_pretrained(model).eval()
+    gpt_model = OpenAIGPT2Model.from_pretrained(model, use_safetensors=False).eval()
     our_model = GPT2Model(GPT2Config(hidden_size=d, num_hidden_layers=l,num_attention_heads=num_heads,
                                      intermediate_size=d*3)).eval()
 

@@ -8,6 +8,7 @@ trains your SonnetGPT model and writes the required submission files.
 '''
 
 import argparse
+import os
 import random
 import torch
 
@@ -28,6 +29,9 @@ from models.gpt2 import GPT2Model
 from optimizer import AdamW
 
 TQDM_DISABLE = False
+OUTPUT_DIR = "/kaggle/working" if os.path.isdir("/kaggle/working") else "."
+CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+PREDICTION_DIR = os.path.join(OUTPUT_DIR, "predictions")
 
 
 # Fix the random seed.
@@ -60,8 +64,10 @@ class SonnetGPT(nn.Module):
     not just the last token! This will allow our model to learn the natural language distribution that composes sonnets,
     not just the distribution over next tokens for the last token!
     """
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    logits = self.gpt.hidden_state_to_token(outputs['last_hidden_state'])
+
+    return logits
 
 
   def get_device(self):
@@ -117,6 +123,7 @@ class SonnetGPT(nn.Module):
 
 
 def save_model(model, optimizer, args, filepath):
+  os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
   save_info = {
     'model': model.state_dict(),
     'optim': optimizer.state_dict(),
@@ -164,7 +171,8 @@ def train(args):
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
       logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')  # Ignore the last prediction in the sequence.
-      labels = b_ids[:, 1:].contiguous().flatten()  # Ignore the first token to compose the labels.
+      labels = b_ids[:, 1:].contiguous()  # Ignore the first token to compose the labels.
+      labels = labels.masked_fill(b_mask[:, 1:].contiguous() == 0, -100).flatten()
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
@@ -182,13 +190,16 @@ def train(args):
       print(f'{batch[1]}{output[1]}\n\n')
 
     # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
-    save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+    save_model(model, optimizer, args, os.path.join(args.checkpoint_dir, f'epoch_{epoch}_{args.filepath}'))
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  saved = torch.load(
+    os.path.join(args.checkpoint_dir, f'epoch_{args.epochs-1}_{args.filepath}'),
+    weights_only=False
+  )
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -261,8 +272,16 @@ def add_arguments(args):
 
 
 if __name__ == "__main__":
+  os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+  os.makedirs(PREDICTION_DIR, exist_ok=True)
   args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
+  run_name = (
+    f'sonnet-{args.model_size}-e{args.epochs}-lr{args.lr}-bs{args.batch_size}'
+    f'-temp{args.temperature}-top{args.top_p}-seed{args.seed}'
+  )
+  args.filepath = f'{run_name}.pt'  # Save path.
+  args.checkpoint_dir = CHECKPOINT_DIR
+  args.sonnet_out = os.path.join(PREDICTION_DIR, f'{run_name}-generated_sonnets.txt')
   seed_everything(args.seed)  # Fix the seed for reproducibility.
   train(args)
   generate_submission_sonnets(args)
