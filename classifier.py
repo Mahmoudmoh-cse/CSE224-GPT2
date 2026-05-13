@@ -6,12 +6,14 @@ Trains and evaluates GPT2SentimentClassifier on SST and CFIMDB
 
 import os
 import random, numpy as np, argparse
+from collections import OrderedDict
 from types import SimpleNamespace
 import csv
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import LambdaLR
 from transformers import GPT2Tokenizer
 from sklearn.metrics import f1_score, accuracy_score
 
@@ -57,10 +59,15 @@ class GPT2SentimentClassifier(torch.nn.Module):
       elif config.fine_tune_mode == 'full-model':
         param.requires_grad = True
 
-    ### TODO: Create any instance variables you need to classify the sentiment of BERT embeddings.
-    ### YOUR CODE HERE
-    self.classifier = torch.nn.Linear(self.gpt.config.hidden_size, self.num_labels)
-    self.dropout = torch.nn.Dropout(config.hidden_dropout_prob)
+    pooled_size = self.gpt.config.hidden_size * 2
+    head_hidden_size = getattr(config, 'head_hidden_size', self.gpt.config.hidden_size)
+    self.classifier = torch.nn.Sequential(OrderedDict([
+      ('layer_norm', torch.nn.LayerNorm(pooled_size)),
+      ('dense', torch.nn.Linear(pooled_size, head_hidden_size)),
+      ('activation', torch.nn.GELU()),
+      ('dropout', torch.nn.Dropout(config.hidden_dropout_prob)),
+      ('out_proj', torch.nn.Linear(head_hidden_size, self.num_labels))
+    ]))
 
 
 
@@ -75,14 +82,15 @@ class GPT2SentimentClassifier(torch.nn.Module):
     # run gpt2 on the input sentences to get the contextualized embeddings
     outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
 
-    # get the hidden state of the last token for each sentence in the batch
+    sequence_output = outputs["last_hidden_state"]
     last_token_hidden_state = outputs["last_token"]
+    expanded_mask = attention_mask.unsqueeze(-1).float()
+    summed_hidden_state = (sequence_output * expanded_mask).sum(dim=1)
+    token_counts = expanded_mask.sum(dim=1).clamp(min=1.0)
+    mean_hidden_state = summed_hidden_state / token_counts
 
-    # apply dropout 
-    last_token_hidden_state = self.dropout(last_token_hidden_state)
-
-    # apply a linear layer to get the logits for each sentiment class
-    logits = self.classifier(last_token_hidden_state)
+    pooled_output = torch.cat([last_token_hidden_state, mean_hidden_state], dim=-1)
+    logits = self.classifier(pooled_output)
 
     # verify that the output shape is correct (batch_size, num_labels)
     assert logits.shape == (input_ids.shape[0], self.num_labels)
@@ -263,6 +271,62 @@ def save_model(model, optimizer, args, config, filepath):
   print(f"save the model to {filepath}")
 
 
+def build_optimizer(model, args):
+  no_decay = ('bias', 'LayerNorm.weight', 'layer_norm.weight', 'norm.weight')
+  optimizer_grouped_parameters = [
+    {
+      'params': [
+        p for n, p in model.gpt.named_parameters()
+        if p.requires_grad and not any(nd in n for nd in no_decay)
+      ],
+      'lr': args.lr,
+      'weight_decay': args.weight_decay
+    },
+    {
+      'params': [
+        p for n, p in model.gpt.named_parameters()
+        if p.requires_grad and any(nd in n for nd in no_decay)
+      ],
+      'lr': args.lr,
+      'weight_decay': 0.0
+    },
+    {
+      'params': [
+        p for n, p in model.classifier.named_parameters()
+        if not any(nd in n for nd in no_decay)
+      ],
+      'lr': args.head_lr,
+      'weight_decay': args.weight_decay
+    },
+    {
+      'params': [
+        p for n, p in model.classifier.named_parameters()
+        if any(nd in n for nd in no_decay)
+      ],
+      'lr': args.head_lr,
+      'weight_decay': 0.0
+    }
+  ]
+  optimizer_grouped_parameters = [
+    group for group in optimizer_grouped_parameters if len(group['params']) > 0
+  ]
+  return AdamW(optimizer_grouped_parameters, lr=args.lr)
+
+
+def build_scheduler(optimizer, total_steps, warmup_ratio):
+  warmup_steps = int(total_steps * warmup_ratio)
+
+  def lr_lambda(current_step):
+    if warmup_steps > 0 and current_step < warmup_steps:
+      return float(current_step) / float(max(1, warmup_steps))
+    return max(
+      0.0,
+      float(total_steps - current_step) / float(max(1, total_steps - warmup_steps))
+    )
+
+  return LambdaLR(optimizer, lr_lambda)
+
+
 def train(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   # Create the data and its corresponding datasets and dataloader.
@@ -281,6 +345,7 @@ def train(args):
   config = {'hidden_dropout_prob': args.hidden_dropout_prob,
             'num_labels': num_labels,
             'hidden_size': 768,
+            'head_hidden_size': args.head_hidden_size,
             'data_dir': '.',
             'fine_tune_mode': args.fine_tune_mode}
 
@@ -289,8 +354,9 @@ def train(args):
   model = GPT2SentimentClassifier(config)
   model = model.to(device)
 
-  lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr)
+  optimizer = build_optimizer(model, args)
+  total_steps = max(1, args.epochs * len(train_dataloader))
+  scheduler = build_scheduler(optimizer, total_steps, args.warmup_ratio)
   best_dev_acc = 0
 
   # Run for the specified number of epochs.
@@ -311,7 +377,9 @@ def train(args):
       loss = F.cross_entropy(logits, b_labels.view(-1), reduction='mean')
 
       loss.backward()
+      torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
       optimizer.step()
+      scheduler.step()
 
       train_loss += loss.item()
       num_batches += 1
@@ -372,6 +440,7 @@ def test(args):
 def get_args():
   parser = argparse.ArgumentParser()
   parser.add_argument("--seed", type=int, default=11711)
+  parser.add_argument("--task", type=str, choices=('sst', 'cfimdb', 'both'), default='sst')
   parser.add_argument("--epochs", type=int, default=5)
   parser.add_argument("--fine-tune-mode", type=str,
                       help='last-linear-layer: the GPT parameters are frozen and the task specific head parameters are updated; full-model: GPT parameters are updated as well',
@@ -379,12 +448,68 @@ def get_args():
   parser.add_argument("--use_gpu", action='store_true')
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
-  parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
+  parser.add_argument("--hidden_dropout_prob", type=float, default=0.2)
   parser.add_argument("--lr", type=float, help="learning rate, default lr for full-model fine-tuning: 1e-5",
                       default=1e-5)
+  parser.add_argument("--head_lr", type=float, help="learning rate for the classifier head", default=5e-4)
+  parser.add_argument("--weight_decay", type=float, default=0.01)
+  parser.add_argument("--max_grad_norm", type=float, default=1.0)
+  parser.add_argument("--warmup_ratio", type=float, default=0.1)
+  parser.add_argument("--head_hidden_size", type=int, default=768)
 
   args = parser.parse_args()
   return args
+
+
+def make_task_config(args, task_name):
+  is_sst = task_name == 'sst'
+  batch_size = args.batch_size if is_sst else 8
+  return SimpleNamespace(
+    filepath=os.path.join(
+      CHECKPOINT_DIR,
+      (
+        f'{task_name}-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}'
+        f'-headlr{args.head_lr}-bs{batch_size}-seed{args.seed}.pt'
+      )
+    ),
+    lr=args.lr,
+    head_lr=args.head_lr,
+    weight_decay=args.weight_decay,
+    max_grad_norm=args.max_grad_norm,
+    warmup_ratio=args.warmup_ratio,
+    use_gpu=args.use_gpu,
+    epochs=args.epochs,
+    batch_size=batch_size,
+    hidden_dropout_prob=args.hidden_dropout_prob,
+    head_hidden_size=args.head_hidden_size,
+    train='data/ids-sst-train.csv' if is_sst else 'data/ids-cfimdb-train.csv',
+    dev='data/ids-sst-dev.csv' if is_sst else 'data/ids-cfimdb-dev.csv',
+    test='data/ids-sst-test-student.csv' if is_sst else 'data/ids-cfimdb-test-student.csv',
+    fine_tune_mode=args.fine_tune_mode,
+    dev_out=os.path.join(
+      PREDICTION_DIR,
+      (
+        f'{task_name}-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}'
+        f'-headlr{args.head_lr}-bs{batch_size}-seed{args.seed}-dev-out.csv'
+      )
+    ),
+    test_out=os.path.join(
+      PREDICTION_DIR,
+      (
+        f'{task_name}-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}'
+        f'-headlr{args.head_lr}-bs{batch_size}-seed{args.seed}-test-out.csv'
+      )
+    )
+  )
+
+
+def run_task(args, task_name):
+  display_name = 'SST' if task_name == 'sst' else 'cfimdb'
+  config = make_task_config(args, task_name)
+  print(f'Training Sentiment Classifier on {display_name}...')
+  train(config)
+  print(f'Evaluating on {display_name}...')
+  test(config)
 
 
 if __name__ == "__main__":
@@ -393,62 +518,7 @@ if __name__ == "__main__":
   args = get_args()
   seed_everything(args.seed)
 
-  print('Training Sentiment Classifier on SST...')
-  config = SimpleNamespace(
-    filepath=os.path.join(
-      CHECKPOINT_DIR,
-      f'sst-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs{args.batch_size}-seed{args.seed}.pt'
-    ),
-    lr=args.lr,
-    use_gpu=args.use_gpu,
-    epochs=args.epochs,
-    batch_size=args.batch_size,
-    hidden_dropout_prob=args.hidden_dropout_prob,
-    train='data/ids-sst-train.csv',
-    dev='data/ids-sst-dev.csv',
-    test='data/ids-sst-test-student.csv',
-    fine_tune_mode=args.fine_tune_mode,
-    dev_out=os.path.join(
-      PREDICTION_DIR,
-      f'sst-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs{args.batch_size}-seed{args.seed}-dev-out.csv'
-    ),
-    test_out=os.path.join(
-      PREDICTION_DIR,
-      f'sst-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs{args.batch_size}-seed{args.seed}-test-out.csv'
-    )
-  )
-
-  train(config)
-
-  print('Evaluating on SST...')
-  test(config)
-
-  print('Training Sentiment Classifier on cfimdb...')
-  config = SimpleNamespace(
-    filepath=os.path.join(
-      CHECKPOINT_DIR,
-      f'cfimdb-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs8-seed{args.seed}.pt'
-    ),
-    lr=args.lr,
-    use_gpu=args.use_gpu,
-    epochs=args.epochs,
-    batch_size=8,
-    hidden_dropout_prob=args.hidden_dropout_prob,
-    train='data/ids-cfimdb-train.csv',
-    dev='data/ids-cfimdb-dev.csv',
-    test='data/ids-cfimdb-test-student.csv',
-    fine_tune_mode=args.fine_tune_mode,
-    dev_out=os.path.join(
-      PREDICTION_DIR,
-      f'cfimdb-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs8-seed{args.seed}-dev-out.csv'
-    ),
-    test_out=os.path.join(
-      PREDICTION_DIR,
-      f'cfimdb-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}-bs8-seed{args.seed}-test-out.csv'
-    )
-  )
-
-  train(config)
-
-  print('Evaluating on cfimdb...')
-  test(config)
+  if args.task in ('sst', 'both'):
+    run_task(args, 'sst')
+  if args.task in ('cfimdb', 'both'):
+    run_task(args, 'cfimdb')
