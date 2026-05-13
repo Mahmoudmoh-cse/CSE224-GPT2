@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR
+from transformers import GPT2Model as HFGPT2Model
 from transformers import GPT2Tokenizer
 from sklearn.metrics import f1_score, accuracy_score
 
@@ -49,7 +50,15 @@ class GPT2SentimentClassifier(torch.nn.Module):
   def __init__(self, config):
     super(GPT2SentimentClassifier, self).__init__()
     self.num_labels = config.num_labels
-    self.gpt = GPT2Model.from_pretrained()
+    self.encoder_backend = getattr(config, 'encoder_backend', 'custom')
+    if self.encoder_backend == 'custom':
+      self.gpt = GPT2Model.from_pretrained()
+      hidden_size = self.gpt.config.hidden_size
+    elif self.encoder_backend == 'hf':
+      self.gpt = HFGPT2Model.from_pretrained('gpt2')
+      hidden_size = self.gpt.config.hidden_size
+    else:
+      raise ValueError(f"Unknown encoder backend: {self.encoder_backend}")
 
     # Pretrain mode does not require updating GPT paramters.
     assert config.fine_tune_mode in ["last-linear-layer", "full-model"]
@@ -59,8 +68,8 @@ class GPT2SentimentClassifier(torch.nn.Module):
       elif config.fine_tune_mode == 'full-model':
         param.requires_grad = True
 
-    pooled_size = self.gpt.config.hidden_size * 2
-    head_hidden_size = getattr(config, 'head_hidden_size', self.gpt.config.hidden_size)
+    pooled_size = hidden_size * 2
+    head_hidden_size = getattr(config, 'head_hidden_size', hidden_size)
     self.classifier = torch.nn.Sequential(OrderedDict([
       ('layer_norm', torch.nn.LayerNorm(pooled_size)),
       ('dense', torch.nn.Linear(pooled_size, head_hidden_size)),
@@ -82,8 +91,13 @@ class GPT2SentimentClassifier(torch.nn.Module):
     # run gpt2 on the input sentences to get the contextualized embeddings
     outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
 
-    sequence_output = outputs["last_hidden_state"]
-    last_token_hidden_state = outputs["last_token"]
+    if self.encoder_backend == 'custom':
+      sequence_output = outputs["last_hidden_state"]
+      last_token_hidden_state = outputs["last_token"]
+    else:
+      sequence_output = outputs.last_hidden_state
+      last_non_pad_idx = attention_mask.sum(dim=1) - 1
+      last_token_hidden_state = sequence_output[torch.arange(sequence_output.shape[0]), last_non_pad_idx]
     expanded_mask = attention_mask.unsqueeze(-1).float()
     summed_hidden_state = (sequence_output * expanded_mask).sum(dim=1)
     token_counts = expanded_mask.sum(dim=1).clamp(min=1.0)
@@ -105,6 +119,7 @@ class SentimentDataset(Dataset):
     self.p = args
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
+    self.prompt_template = getattr(args, 'prompt_template', '{sentence}')
 
   def __len__(self):
     return len(self.dataset)
@@ -113,7 +128,7 @@ class SentimentDataset(Dataset):
     return self.dataset[idx]
 
   def pad_data(self, data):
-    sents = [x[0] for x in data]
+    sents = [self.prompt_template.format(sentence=x[0]) for x in data]
     labels = [x[1] for x in data]
     sent_ids = [x[2] for x in data]
 
@@ -144,6 +159,7 @@ class SentimentTestDataset(Dataset):
     self.p = args
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
+    self.prompt_template = getattr(args, 'prompt_template', '{sentence}')
 
   def __len__(self):
     return len(self.dataset)
@@ -152,7 +168,7 @@ class SentimentTestDataset(Dataset):
     return self.dataset[idx]
 
   def pad_data(self, data):
-    sents = [x[0] for x in data]
+    sents = [self.prompt_template.format(sentence=x[0]) for x in data]
     sent_ids = [x[1] for x in data]
 
     encoding = self.tokenizer(sents, return_tensors='pt', padding=True, truncation=True)
@@ -181,13 +197,13 @@ def load_data(filename, flag='train'):
   if flag == 'test':
     with open(filename, 'r') as fp:
       for record in csv.DictReader(fp, delimiter='\t'):
-        sent = record['sentence'].lower().strip()
+        sent = record['sentence'].strip()
         sent_id = record['id'].lower().strip()
         data.append((sent, sent_id))
   else:
     with open(filename, 'r') as fp:
       for record in csv.DictReader(fp, delimiter='\t'):
-        sent = record['sentence'].lower().strip()
+        sent = record['sentence'].strip()
         sent_id = record['id'].lower().strip()
         label = int(record['sentiment'].strip())
         if label not in num_labels:
@@ -272,7 +288,7 @@ def save_model(model, optimizer, args, config, filepath):
 
 
 def build_optimizer(model, args):
-  no_decay = ('bias', 'LayerNorm.weight', 'layer_norm.weight', 'norm.weight')
+  no_decay = ('bias', 'LayerNorm.weight', 'layer_norm.weight', 'norm.weight', 'ln_')
   optimizer_grouped_parameters = [
     {
       'params': [
@@ -347,6 +363,7 @@ def train(args):
             'hidden_size': 768,
             'head_hidden_size': args.head_hidden_size,
             'data_dir': '.',
+            'encoder_backend': args.encoder_backend,
             'fine_tune_mode': args.fine_tune_mode}
 
   config = SimpleNamespace(**config)
@@ -456,6 +473,9 @@ def get_args():
   parser.add_argument("--max_grad_norm", type=float, default=1.0)
   parser.add_argument("--warmup_ratio", type=float, default=0.1)
   parser.add_argument("--head_hidden_size", type=int, default=768)
+  parser.add_argument("--encoder_backend", type=str, choices=('custom', 'hf'), default='custom')
+  parser.add_argument("--prompt_template", type=str, default='Review: {sentence}\nSentiment:')
+  parser.add_argument("--no_prompt", action='store_true')
 
   args = parser.parse_args()
   return args
@@ -464,12 +484,14 @@ def get_args():
 def make_task_config(args, task_name):
   is_sst = task_name == 'sst'
   batch_size = args.batch_size if is_sst else 8
+  prompt_template = '{sentence}' if args.no_prompt else args.prompt_template
+  prompt_name = 'noprompt' if args.no_prompt else 'prompt'
   return SimpleNamespace(
     filepath=os.path.join(
       CHECKPOINT_DIR,
       (
         f'{task_name}-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}'
-        f'-headlr{args.head_lr}-bs{batch_size}-seed{args.seed}.pt'
+        f'-headlr{args.head_lr}-{args.encoder_backend}-{prompt_name}-bs{batch_size}-seed{args.seed}.pt'
       )
     ),
     lr=args.lr,
@@ -482,6 +504,8 @@ def make_task_config(args, task_name):
     batch_size=batch_size,
     hidden_dropout_prob=args.hidden_dropout_prob,
     head_hidden_size=args.head_hidden_size,
+    encoder_backend=args.encoder_backend,
+    prompt_template=prompt_template,
     train='data/ids-sst-train.csv' if is_sst else 'data/ids-cfimdb-train.csv',
     dev='data/ids-sst-dev.csv' if is_sst else 'data/ids-cfimdb-dev.csv',
     test='data/ids-sst-test-student.csv' if is_sst else 'data/ids-cfimdb-test-student.csv',
@@ -490,14 +514,14 @@ def make_task_config(args, task_name):
       PREDICTION_DIR,
       (
         f'{task_name}-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}'
-        f'-headlr{args.head_lr}-bs{batch_size}-seed{args.seed}-dev-out.csv'
+        f'-headlr{args.head_lr}-{args.encoder_backend}-{prompt_name}-bs{batch_size}-seed{args.seed}-dev-out.csv'
       )
     ),
     test_out=os.path.join(
       PREDICTION_DIR,
       (
         f'{task_name}-{args.fine_tune_mode}-e{args.epochs}-lr{args.lr}'
-        f'-headlr{args.head_lr}-bs{batch_size}-seed{args.seed}-test-out.csv'
+        f'-headlr{args.head_lr}-{args.encoder_backend}-{prompt_name}-bs{batch_size}-seed{args.seed}-test-out.csv'
       )
     )
   )
